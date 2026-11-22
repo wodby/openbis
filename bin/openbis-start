@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+#
+# Starts openBIS (application server, data store server and file server) in one container.
+#
+# All state lives on one volume, /data: configuration (/data/etc), generated keys and the first-start marker
+# (/data/.wodby), and the openBIS store (/data/openbis). The databases must already exist and belong to the user in
+# OPENBIS_DB_USER, which needs no superuser, create-role or create-database rights. The script exits as soon as one of
+# the Java servers stops, so the container restarts as a whole.
+
+set -eo pipefail
+
+if [[ -n "${DEBUG}" ]]; then
+    set -x
+fi
+
+OPENBIS_HOME=/home/openbis
+SERVERS="${OPENBIS_HOME}/servers"
+AS_HOME="${SERVERS}/openBIS-server/jetty"
+DSS_HOME="${SERVERS}/datastore_server"
+AFS_HOME="${SERVERS}/afs-server"
+DATA=/data
+STATE="${DATA}/.wodby"
+STORE="${DATA}/openbis"
+ETC="${DATA}/etc"
+LOG_DIR=/var/log/openbis
+
+log() {
+    echo "[openbis-start] $*"
+}
+
+fail() {
+    echo "[openbis-start] ERROR: $*" >&2
+    exit 1
+}
+
+require() {
+    local name
+    for name in "$@"; do
+        [[ -n "${!name}" ]] || fail "${name} is not set"
+    done
+}
+
+# set_property FILE KEY VALUE replaces KEY's line in a Java properties file, commented out or not, or appends it.
+# Values go through a file, not sed, so passwords and keys may hold any character.
+set_property() {
+    local file="$1" key="$2" value="$3"
+    KEY="${key}" VALUE="${value}" python3 -I - "${file}" <<'PY'
+import os, re, sys
+path = sys.argv[1]
+key, value = os.environ["KEY"], os.environ["VALUE"]
+# Java properties treat backslashes as escapes.
+value = value.replace("\\", "\\\\")
+pattern = re.compile(r"^[#!\s]*" + re.escape(key) + r"\s*[=:]")
+lines = open(path).read().splitlines()
+out, done = [], False
+for line in lines:
+    if pattern.match(line):
+        if not done:
+            out.append(f"{key} = {value}")
+            done = True
+        continue
+    out.append(line)
+if not done:
+    out.append(f"{key} = {value}")
+open(path, "w").write("\n".join(out) + "\n")
+PY
+}
+
+# split_db_name NAME prints openBIS's basic name and kind for NAME: openBIS names a database <basic>_<kind>.
+split_db_name() {
+    local name="$1"
+    [[ "${name}" == *_* ]] || fail "database name ${name} has no underscore; openBIS needs <name>_<kind>"
+    echo "${name%_*} ${name##*_}"
+}
+
+random_key() {
+    python3 -I -c 'import secrets; print(secrets.token_hex(24))'
+}
+
+# --- Settings ---------------------------------------------------------------------------------------------------
+
+OPENBIS_HOST="${OPENBIS_HOST:-${WODBY_PRIMARY_HOST}}"
+OPENBIS_PUBLIC_SCHEME="${OPENBIS_PUBLIC_SCHEME:-https}"
+OPENBIS_DB_PORT="${OPENBIS_DB_PORT:-5432}"
+require OPENBIS_HOST OPENBIS_ADMIN_PASSWORD OPENBIS_DB_HOST OPENBIS_DB_NAME OPENBIS_DB_MESSAGES_NAME \
+    OPENBIS_DB_PATHINFO_NAME OPENBIS_DB_USER OPENBIS_DB_PASSWORD
+[[ "${OPENBIS_PUBLIC_SCHEME}" =~ ^https?$ ]] || fail "OPENBIS_PUBLIC_SCHEME must be http or https"
+[[ "${OPENBIS_HOST}" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || fail "OPENBIS_HOST ${OPENBIS_HOST} is not a host name"
+PUBLIC_URL="${OPENBIS_PUBLIC_SCHEME}://${OPENBIS_HOST}"
+DB_HOST_PART="${OPENBIS_DB_HOST}:${OPENBIS_DB_PORT}"
+
+# --- Volume layout and generated keys ---------------------------------------------------------------------------
+
+[[ -w "${DATA}" ]] || fail "${DATA} is not writable by uid $(id -u)"
+mkdir -p "${STATE}" "${ETC}/as" "${ETC}/dss" "${ETC}/afs" "${LOG_DIR}" \
+    "${STORE}/store" "${STORE}/raw-store" "${STORE}/cache-workspace" "${STORE}/session-workspace" \
+    "${STORE}/api-workspace" "${STORE}/commandqueue" "${STORE}/transactions" "${STORE}/transaction-logs"
+chmod 700 "${STATE}"
+
+if [[ ! -f "${STATE}/keys.env" ]]; then
+    log "Generating this installation's keys"
+    umask 077
+    {
+        echo "COORDINATOR_KEY=$(random_key)"
+        echo "INTERACTIVE_SESSION_KEY=$(random_key)"
+        echo "ETLSERVER_PASSWORD=$(random_key)"
+        echo "AFSSERVER_PASSWORD=$(random_key)"
+    } > "${STATE}/keys.env.tmp"
+    mv "${STATE}/keys.env.tmp" "${STATE}/keys.env"
+    umask 022
+fi
+# shellcheck disable=SC1091
+source "${STATE}/keys.env"
+
+# Configuration comes from the image on every start, so a new image brings its new defaults. Files that hold state
+# stay on the volume: user passwords and openBIS's own version markers. A service.properties.local next to a server's
+# service.properties is appended to it; later lines win.
+refresh_etc() {
+    local defaults="$1" target="$2" file
+    shift 2
+    for file in "${defaults}"/*; do
+        local name keep=""
+        name="$(basename "${file}")"
+        for keep_name in "$@"; do
+            [[ "${name}" == "${keep_name}" ]] && keep=1
+        done
+        if [[ -n "${keep}" && -e "${target}/${name}" ]]; then
+            continue
+        fi
+        cp -f "${file}" "${target}/${name}"
+    done
+}
+refresh_etc "${AS_HOME}/etc.default" "${ETC}/as" passwd passwd.sv
+refresh_etc "${DSS_HOME}/etc.default" "${ETC}/dss"
+refresh_etc "${AFS_HOME}/etc.default" "${ETC}/afs"
+
+append_local() {
+    local file="$1"
+    if [[ -f "${file}.local" ]]; then
+        log "Appending ${file}.local"
+        { echo; echo "# --- ${file}.local ---"; cat "${file}.local"; } >> "${file}"
+    fi
+}
+
+# --- Application server -----------------------------------------------------------------------------------------
+
+AS_PROPS="${ETC}/as/service.properties"
+read -r MESSAGES_BASIC MESSAGES_KIND < <(split_db_name "${OPENBIS_DB_MESSAGES_NAME}")
+set_property "${AS_PROPS}" database.url-host-part "${DB_HOST_PART}"
+set_property "${AS_PROPS}" database.name "${OPENBIS_DB_NAME}"
+set_property "${AS_PROPS}" database.owner "${OPENBIS_DB_USER}"
+set_property "${AS_PROPS}" database.owner-password "${OPENBIS_DB_PASSWORD}"
+set_property "${AS_PROPS}" database.admin-user "${OPENBIS_DB_USER}"
+set_property "${AS_PROPS}" database.admin-password "${OPENBIS_DB_PASSWORD}"
+set_property "${AS_PROPS}" messages-database.url-host-part "${DB_HOST_PART}"
+set_property "${AS_PROPS}" messages-database.name "${OPENBIS_DB_MESSAGES_NAME}"
+set_property "${AS_PROPS}" messages-database.basic-name "${MESSAGES_BASIC}"
+set_property "${AS_PROPS}" messages-database.kind "${MESSAGES_KIND}"
+set_property "${AS_PROPS}" messages-database.owner "${OPENBIS_DB_USER}"
+set_property "${AS_PROPS}" messages-database.owner-password "${OPENBIS_DB_PASSWORD}"
+set_property "${AS_PROPS}" messages-database.admin-user "${OPENBIS_DB_USER}"
+set_property "${AS_PROPS}" messages-database.admin-password "${OPENBIS_DB_PASSWORD}"
+set_property "${AS_PROPS}" download-url "${PUBLIC_URL}"
+set_property "${AS_PROPS}" server-public-information.afs-server.url "${PUBLIC_URL}/afs-server"
+set_property "${AS_PROPS}" trusted-cross-origin-domains "${PUBLIC_URL}"
+set_property "${AS_PROPS}" root-dir "${STORE}"
+set_property "${AS_PROPS}" file-server.repository-path "${STORE}/raw-store"
+set_property "${AS_PROPS}" eln-lims.as.miscellaneous.file-service.file-server.repository-path "${STORE}/raw-store"
+set_property "${AS_PROPS}" session-workspace-root-dir "${STORE}/session-workspace"
+set_property "${AS_PROPS}" api.v3.operation-execution.cache.directory "${STORE}/api-workspace"
+set_property "${AS_PROPS}" personal-access-tokens-file-path "${STATE}/personal-access-tokens.json"
+set_property "${AS_PROPS}" api.v3.transaction.coordinator-key "${COORDINATOR_KEY}"
+set_property "${AS_PROPS}" api.v3.transaction.interactive-session-key "${INTERACTIVE_SESSION_KEY}"
+set_property "${AS_PROPS}" api.v3.transaction.transaction-log-folder-path "${STORE}/transaction-logs"
+set_property "${AS_PROPS}" api.v3.transaction.participant.application-server.url "http://localhost:8080"
+set_property "${AS_PROPS}" api.v3.transaction.participant.afs-server.url "http://localhost:8085/afs-server"
+if [[ -n "${SMTP_HOST}" ]]; then
+    set_property "${AS_PROPS}" mail.smtp.host "${SMTP_HOST}"
+    set_property "${AS_PROPS}" mail.smtp.port "${SMTP_PORT:-25}"
+    set_property "${AS_PROPS}" mail.smtp.user "${SMTP_USER}"
+    set_property "${AS_PROPS}" mail.smtp.password "${SMTP_PASSWORD}"
+fi
+set_property "${AS_PROPS}" mail.from "${OPENBIS_MAIL_FROM:-noreply@${OPENBIS_HOST%%:*}}"
+append_local "${AS_PROPS}"
+set_property "${ETC}/as/openbis.conf" JAVA_MEM_OPTS "\"-XX:+UseG1GC -XX:MaxRAMPercentage=${OPENBIS_AS_MAX_RAM_PERCENTAGE:-45}\""
+sed -i 's/^JAVA_MEM_OPTS = /JAVA_MEM_OPTS=/' "${ETC}/as/openbis.conf"
+
+# --- Data store server ------------------------------------------------------------------------------------------
+
+DSS_PROPS="${ETC}/dss/service.properties"
+read -r PATHINFO_BASIC PATHINFO_KIND < <(split_db_name "${OPENBIS_DB_PATHINFO_NAME}")
+set_property "${DSS_PROPS}" path-info-db.urlHostPart "${DB_HOST_PART}"
+set_property "${DSS_PROPS}" path-info-db.basicDatabaseName "${PATHINFO_BASIC}"
+set_property "${DSS_PROPS}" path-info-db.databaseKind "${PATHINFO_KIND}"
+set_property "${DSS_PROPS}" path-info-db.owner "${OPENBIS_DB_USER}"
+set_property "${DSS_PROPS}" path-info-db.password "${OPENBIS_DB_PASSWORD}"
+set_property "${DSS_PROPS}" path-info-db.adminUser "${OPENBIS_DB_USER}"
+set_property "${DSS_PROPS}" path-info-db.adminPassword "${OPENBIS_DB_PASSWORD}"
+set_property "${DSS_PROPS}" host-address "http://localhost"
+set_property "${DSS_PROPS}" port 8081
+set_property "${DSS_PROPS}" use-ssl false
+set_property "${DSS_PROPS}" server-url "http://localhost:8080"
+set_property "${DSS_PROPS}" download-url "${PUBLIC_URL}"
+set_property "${DSS_PROPS}" password "${ETLSERVER_PASSWORD}"
+set_property "${DSS_PROPS}" root-dir "${STORE}"
+set_property "${DSS_PROPS}" cache-workspace-folder "${STORE}/cache-workspace"
+set_property "${DSS_PROPS}" session-workspace-root-dir "${STORE}/session-workspace"
+set_property "${DSS_PROPS}" commandqueue-dir "${STORE}/commandqueue"
+if [[ -n "${SMTP_HOST}" ]]; then
+    set_property "${DSS_PROPS}" mail.smtp.host "${SMTP_HOST}"
+    set_property "${DSS_PROPS}" mail.smtp.port "${SMTP_PORT:-25}"
+    set_property "${DSS_PROPS}" mail.from "${OPENBIS_MAIL_FROM:-noreply@${OPENBIS_HOST%%:*}}"
+fi
+append_local "${DSS_PROPS}"
+set_property "${ETC}/dss/datastore_server.conf" JAVA_MEM_OPTS "\"-XX:+UseG1GC -XX:MaxRAMPercentage=${OPENBIS_DSS_MAX_RAM_PERCENTAGE:-12}\""
+sed -i 's/^JAVA_MEM_OPTS = /JAVA_MEM_OPTS=/' "${ETC}/dss/datastore_server.conf"
+
+# --- File server ------------------------------------------------------------------------------------------------
+
+AFS_PROPS="${ETC}/afs/service.properties"
+set_property "${AFS_PROPS}" openBISUrl "http://localhost:8080"
+set_property "${AFS_PROPS}" openBISPassword "${AFSSERVER_PASSWORD}"
+set_property "${AFS_PROPS}" openBISLastSeenDeletionFile "${STATE}/afs-last-seen-deletion"
+set_property "${AFS_PROPS}" httpServerPublicUrl "${PUBLIC_URL}/afs-server"
+set_property "${AFS_PROPS}" apiServerInteractiveSessionKey "${INTERACTIVE_SESSION_KEY}"
+set_property "${AFS_PROPS}" apiServerTransactionManagerKey "${COORDINATOR_KEY}"
+set_property "${AFS_PROPS}" writeAheadLogRoot "${STORE}/transactions"
+set_property "${AFS_PROPS}" storageRoot "${STORE}/store"
+append_local "${AFS_PROPS}"
+set_property "${ETC}/afs/afs_server.conf" JAVA_MEM_OPTS "\"-XX:+UseG1GC -XX:MaxRAMPercentage=${OPENBIS_AFS_MAX_RAM_PERCENTAGE:-12}\""
+sed -i 's/^JAVA_MEM_OPTS = /JAVA_MEM_OPTS=/' "${ETC}/afs/afs_server.conf"
+
+# --- Databases --------------------------------------------------------------------------------------------------
+
+export PGPASSWORD="${OPENBIS_DB_PASSWORD}"
+psql_db() {
+    psql -X -q -tA -v ON_ERROR_STOP=1 -h "${OPENBIS_DB_HOST}" -p "${OPENBIS_DB_PORT}" -U "${OPENBIS_DB_USER}" -d "$1" "${@:2}"
+}
+
+log "Waiting for PostgreSQL at ${DB_HOST_PART}"
+for i in $(seq 1 60); do
+    if psql_db "${OPENBIS_DB_NAME}" -c 'SELECT 1' >/dev/null 2>&1; then
+        break
+    fi
+    [[ "${i}" == 60 ]] && fail "cannot connect to database ${OPENBIS_DB_NAME} as ${OPENBIS_DB_USER}"
+    sleep 5
+done
+
+# openBIS's administrative connection names no database, so PostgreSQL connects it to the database named after the
+# user. Wodby names the main database and its user alike.
+if ! psql_db "${OPENBIS_DB_USER}" -c 'SELECT 1' >/dev/null 2>&1; then
+    fail "openBIS needs a database named after its user ${OPENBIS_DB_USER} that the user can connect to"
+fi
+
+# openBIS treats a database without its version table as missing and then tries to create roles and the database,
+# which needs superuser rights. A version-0 entry instead makes it run its schema and initial-data scripts itself, as
+# the owner.
+for db in "${OPENBIS_DB_NAME}" "${OPENBIS_DB_MESSAGES_NAME}" "${OPENBIS_DB_PATHINFO_NAME}"; do
+    psql_db "${db}" <<'SQL'
+DO $$
+BEGIN
+    IF to_regclass('public.database_version_logs') IS NULL THEN
+        IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public') THEN
+            RAISE EXCEPTION 'database % has tables but no openBIS version log; refusing to initialize it', current_database();
+        END IF;
+        CREATE TABLE public.database_version_logs (db_version varchar(4) NOT NULL, module_name varchar(250),
+            run_status varchar(10), run_status_timestamp timestamp, module_code bytea, run_exception bytea);
+        INSERT INTO public.database_version_logs (db_version, module_name, run_status, run_status_timestamp)
+            VALUES ('0', 'wodby-bootstrap', 'SUCCESS', now());
+        RAISE NOTICE 'Prepared empty database % for openBIS', current_database();
+    END IF;
+END
+$$;
+SQL
+done
+
+if [[ "$(psql_db postgres -c 'SHOW max_prepared_transactions' 2>/dev/null || psql_db "${OPENBIS_DB_NAME}" -c 'SHOW max_prepared_transactions')" == 0 ]]; then
+    log "WARNING: max_prepared_transactions is 0 on the database server; openBIS transactions across its servers will fail"
+fi
+
+# --- Users of the file-based authentication ---------------------------------------------------------------------
+
+# The data store server and file server sign in to the application server as etlserver and afsserver. Their
+# passwords are this installation's, not the image's defaults, and the admin password follows the setting.
+passwd_set() {
+    "${AS_HOME}/bin/passwd.sh" change "$1" -p "$2" >/dev/null
+}
+passwd_set etlserver "${ETLSERVER_PASSWORD}"
+passwd_set afsserver "${AFSSERVER_PASSWORD}"
+passwd_set admin "${OPENBIS_ADMIN_PASSWORD}"
+chmod 600 "${ETC}/as/passwd" "${ETC}/as/passwd.sv" 2>/dev/null || true
+
+# --- Start and supervise ----------------------------------------------------------------------------------------
+
+AS_PID_FILE="${AS_HOME}/openbis.pid"
+DSS_PID_FILE="${DSS_HOME}/datastore_server.pid"
+AFS_PID_FILE="${AFS_HOME}/afs_server.pid"
+
+alive() {
+    local pid
+    pid="$(cat "$1" 2>/dev/null)" || return 1
+    [[ -n "${pid}" ]] || return 1
+    local state
+    state="$(ps -o stat= -p "${pid}" 2>/dev/null)" || return 1
+    [[ -n "${state}" && "${state}" != Z* ]]
+}
+
+stopping=""
+stop_all() {
+    stopping=1
+    log "Stopping openBIS"
+    "${OPENBIS_HOME}/bin/afs-service.sh" stop >/dev/null 2>&1 || true
+    "${OPENBIS_HOME}/bin/dss-service.sh" stop >/dev/null 2>&1 || true
+    "${OPENBIS_HOME}/bin/as-service.sh" stop >/dev/null 2>&1 || true
+}
+on_term() {
+    stop_all
+    exit 0
+}
+trap on_term TERM INT
+
+log "Starting the application server (first start creates the schema and can take several minutes)"
+"${OPENBIS_HOME}/bin/as-service.sh" start || { stop_all; fail "the application server did not start"; }
+log "Starting the data store server"
+"${OPENBIS_HOME}/bin/dss-service.sh" start || { stop_all; fail "the data store server did not start"; }
+log "Starting the file server"
+"${OPENBIS_HOME}/bin/afs-service.sh" start || { stop_all; fail "the file server did not start"; }
+touch "${STATE}/initialized"
+log "openBIS is running at ${PUBLIC_URL}/openbis/webapp/eln-lims/"
+
+while true; do
+    for pid_file in "${AS_PID_FILE}" "${DSS_PID_FILE}" "${AFS_PID_FILE}"; do
+        if ! alive "${pid_file}"; then
+            [[ -n "${stopping}" ]] && exit 0
+            log "$(basename "$(dirname "${pid_file}")") stopped; stopping the container"
+            stop_all
+            exit 1
+        fi
+    done
+    sleep 5 &
+    wait $! || true
+done
