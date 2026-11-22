@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "image": "wodby/openbis",
+  "versions": [
+    {
+      "version": {
+        "env": "OPENBIS70"
+      },
+      "variants": [
+        {
+          "short": [
+            "{minor}"
+          ],
+          "full": "{version}"
+        }
+      ]
+    }
+  ]
+}
